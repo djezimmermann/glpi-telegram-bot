@@ -18,6 +18,15 @@ Projeto criado para facilitar o atendimento técnico e agilizar operações do S
 - Menus interativos para usuários
 - Sessões inteligentes de atendimento
 
+## Segurança
+
+Este repositório contém versão sanitizada para portfólio:
+
+- Tokens removidos
+- Credenciais removidas
+- URLs internas ocultadas
+- Dados sensíveis substituídos
+
 ## Tecnologias Utilizadas
 
 - n8n
