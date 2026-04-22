@@ -1,0 +1,1738 @@
+{
+  "name": "GLPI Bot Telegram - v2 Completo (Sanitizado)",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "55ea0b1d-110a-4a41-80be-3578a57f4875",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        4624,
+        3808
+      ],
+      "webhookId": "b67105e5-633e-4210-98fc-d67d7f1bea83",
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e70343f5-fa0c-4719-94c1-c2b5fc3dab2a",
+              "name": "glpi_base_url",
+              "value": "https://glpi.example.com/apirest.php",
+              "type": "string"
+            },
+            {
+              "id": "55063996-d869-45f0-a7b3-7603388eb3f2",
+              "name": "glpi_app_token",
+              "value": "GLPI_APP_TOKEN",
+              "type": "string"
+            },
+            {
+              "id": "3a4269e5-a483-46b4-a9da-c012ff2750a3",
+              "name": "telegram_bot_token",
+              "value": "TELEGRAM_BOT_TOKEN",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "2adadd7c-3225-4e1b-80f4-99912a7b5627",
+      "name": "Configuração",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4656,
+        4064
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────\n// HELPERS\n// ─────────────────────────────────────────────\nconst store = $getWorkflowStaticData('global');\nstore.sessions = store.sessions || {};\nstore.albums   = store.albums   || {};\n\nconst now = Date.now();\nfor (const [k,v] of Object.entries(store.albums))   { if (!v?.expiresAt || v.expiresAt < now) delete store.albums[k]; }\nfor (const [k,v] of Object.entries(store.sessions)) { if (!v?.updatedAt || now - v.updatedAt > 86400000) delete store.sessions[k]; }\n\nfunction txt(item)  { return (item.json.message?.text || item.json.message?.caption || '').trim(); }\nfunction low(item)  { return txt(item).toLowerCase(); }\n\nfunction extractTicket(value) {\n  const m = String(value||'').match(/\\b\\d+\\b/);\n  return m ? m[0] : '';\n}\n\nfunction mapStatus(value) {\n  const v = String(value||'').trim().toLowerCase();\n  const map = {\n    '1':1,'novo':1,'new':1,\n    '2':2,'em atendimento':2,'atribuido':2,'atribuído':2,\n    '3':3,'planejado':3,'planned':3,\n    '4':4,'pendente':4,'pending':4,\n    '5':5,'solucionado':5,'resolvido':5,'solved':5,\n    '6':6,'fechado':6,'closed':6\n  };\n  return map[v] || null;\n}\n\nfunction mapPriority(value) {\n  const v = String(value||'').trim().toLowerCase();\n  const map = {\n    '1':1,'agendamento':1,\n    '2':2,'normal 48h':2,'normal 48 horas':2,'normal':2,\n    '3':3,'solucionar':3,\n    '4':4,'alerta':4,\n    '5':5,'retorno/serv. rápido':5,'retorno':5,'servico rapido':5,'serviço rápido':5,\n    '6':6,'urgente':6\n  };\n  return map[v] || null;\n}\n\nfunction proxDiasUteis(qtd) {\n  const TZ_OFFSET = -3 * 60;\n  const agora = new Date(now + TZ_OFFSET * 60000);\n  const hojeLocal = new Date(agora.toISOString().slice(0,10) + 'T00:00:00.000Z');\n  const hojeDow = hojeLocal.getUTCDay();\n  const horaLocal = agora.getUTCHours() + agora.getUTCMinutes()/60;\n  const ehSabado = hojeDow === 6;\n  const aposDeadlineSabado = ehSabado && horaLocal >= 12;\n\n  const dias = [];\n  let cursor = new Date(hojeLocal);\n  cursor.setUTCDate(cursor.getUTCDate() + 1);\n\n  while (dias.length < qtd) {\n    const dow = cursor.getUTCDay();\n    if (dow === 0) { cursor.setUTCDate(cursor.getUTCDate() + 1); continue; }\n    if (dow === 6 && aposDeadlineSabado) { cursor.setUTCDate(cursor.getUTCDate() + 1); continue; }\n    dias.push(new Date(cursor));\n    cursor.setUTCDate(cursor.getUTCDate() + 1);\n  }\n  return dias;\n}\n\nfunction formatBR(d) {\n  const dd = String(d.getUTCDate()).padStart(2,'0');\n  const mm = String(d.getUTCMonth()+1).padStart(2,'0');\n  const yyyy = d.getUTCFullYear();\n  return `${dd}/${mm}/${yyyy}`;\n}\n\nfunction dowLabel(d) {\n  const nomes = ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];\n  return nomes[d.getUTCDay()];\n}\n\nfunction toGLPIDate(brDate, hora) {\n  const [dd,mm,yyyy] = brDate.split('/');\n  const horaStr = hora.includes(':') ? hora : hora + ':00:00';\n  const [hh,min,ss] = horaStr.split(':').map(Number);\n  return `${yyyy}-${mm}-${dd} ${String(hh).padStart(2,'0')}:${String(min).padStart(2,'0')}:${String(ss||0).padStart(2,'0')}`;\n}\n\n// Teclado fixo sempre visível\nconst menuKeyboard = {\n  keyboard: [\n    [{ text: '🏠 Menu' }, { text: '❌ Cancelar' }]\n  ],\n  resize_keyboard: true,\n  one_time_keyboard: false\n};\n\n// Monta reply_markup com botões de opção (inline como linhas do Reply Keyboard)\nfunction opcoesTeclado(opcoes, comMenu) {\n  // Monta linhas de botões — até 2 por linha\n  const rows = [];\n  for (let i = 0; i < opcoes.length; i += 2) {\n    const row = [{ text: opcoes[i] }];\n    if (opcoes[i+1]) row.push({ text: opcoes[i+1] });\n    rows.push(row);\n  }\n  if (comMenu !== false) rows.push([{ text: '🏠 Menu' }, { text: '❌ Cancelar' }]);\n  return { keyboard: rows, resize_keyboard: true, one_time_keyboard: true };\n}\n\nfunction menuText() {\n  return [\n    '🤖 *Menu GLPI*',\n    '',\n    'Escolha uma opção:'\n  ].join('\\n');\n}\n\nfunction menuMarkup() {\n  return {\n    keyboard: [\n      [{ text: '1️⃣ Abrir chamado' }, { text: '2️⃣ Ver chamado' }],\n      [{ text: '3️⃣ Mudar status'  }, { text: '4️⃣ Fechar chamado' }],\n      [{ text: '5️⃣ Enviar mídia'  }, { text: '6️⃣ Comentar chamado' }],\n      [{ text: '7️⃣ Foto/Vídeo + Solucionar' }]\n    ],\n    resize_keyboard: true,\n    one_time_keyboard: true\n  };\n}\n\n// Normaliza texto dos botões do menu para os mesmos comandos\nfunction normalizarMenu(t) {\n  const map = {\n    '1️⃣ abrir chamado':          '1',\n    '2️⃣ ver chamado':             '2',\n    '3️⃣ mudar status':            '3',\n    '4️⃣ fechar chamado':          '4',\n    '5️⃣ enviar mídia':            '5',\n    '6️⃣ comentar chamado':        '6',\n    '7️⃣ foto/vídeo + solucionar': '7',\n    '🏠 menu':                    '/menu',\n    '❌ cancelar':                '/cancelar'\n  };\n  return map[t.toLowerCase()] || t.toLowerCase();\n}\n\n// ─────────────────────────────────────────────\n// LOOP PRINCIPAL\n// ─────────────────────────────────────────────\nreturn items.map((item) => {\n  const message   = item.json.message || {};\n  const chatId    = String(message.chat?.id || '');\n  const userText  = txt(item);\n  const userTextN = normalizarMenu(userText);\n  const isPhoto   = Array.isArray(message.photo) && message.photo.length > 0;\n  const isVideo   = !!message.video || !!message.video_note;\n  const isMedia   = isPhoto || isVideo;\n  const mediaGroupId = message.media_group_id ? String(message.media_group_id) : '';\n  const session   = store.sessions[chatId] || { state:'idle', data:{}, updatedAt:now };\n\n  function save(state, data) { store.sessions[chatId] = { state, data: data||{}, updatedAt:now }; }\n  function clear()           { delete store.sessions[chatId]; }\n\n  function reply(text, markup) {\n    return { json: {\n      ...item.json,\n      action: 'reply',\n      chat_id: chatId,\n      reply_text: text,\n      reply_markup: markup || menuKeyboard\n    }};\n  }\n\n  if (!chatId) return { json:{ ...item.json, action:'ignore', reply_text:'', chat_id:'' } };\n\n  // ── Comandos globais ──\n  if (['/start','/menu','menu', '🏠 menu'].includes(userTextN)) {\n    save('idle',{});\n    return reply(menuText(), menuMarkup());\n  }\n  if (['/cancelar','cancelar','❌ cancelar'].includes(userTextN)) {\n    clear();\n    return reply('✅ Operação cancelada.\\n\\nEscolha uma opção:', menuMarkup());\n  }\n  if (['/fim','fim'].includes(userTextN)) {\n    if (session.state === 'photo_mode') { clear(); return reply('📷 Modo foto encerrado.\\n\\nEscolha uma opção:', menuMarkup()); }\n    return reply('Não havia modo foto ativo.\\n\\nEscolha uma opção:', menuMarkup());\n  }\n\n  // Atalhos diretos\n  const mFoto = userTextN.match(/^\\/foto\\s+(\\d+)$/) || userTextN.match(/^\\/midia\\s+(\\d+)$/);\n  if (mFoto) { save('photo_mode',{ticket_id:mFoto[1]}); return reply(`📷 Modo foto ativado para chamado *#${mFoto[1]}*.\\nEnvie as fotos. Pressione *❌ Cancelar* para sair.`); }\n\n  const mVer = userTextN.match(/^\\/ver\\s+(\\d+)$/);\n  if (mVer)  { clear(); return { json:{ ...item.json, action:'view_ticket', chat_id:chatId, ticket_id:mVer[1] } }; }\n\n  // ════════════════════════════════════════════\n  const st = session.state;\n  const sd = session.data || {};\n\n  // ── IDLE ──\n  if (st === 'idle') {\n    const v = userTextN;\n    if (['1','abrir chamado','/abrir'].includes(v)) {\n      save('open_await_title',{});\n      return reply('📝 *Abrir chamado*\\n\\nInforme o *título* do chamado:');\n    }\n    if (['2','ver chamado','/ver'].includes(v)) {\n      save('await_view_ticket',{});\n      return reply('🔍 Informe o *número* do chamado:');\n    }\n    if (['3','mudar status','/status'].includes(v)) {\n      save('await_status_ticket',{});\n      return reply('🔄 Informe o *número* do chamado para alterar o status:');\n    }\n    if (['4','fechar chamado','/fechar'].includes(v)) {\n      save('await_close_ticket',{});\n      return reply('✅ Informe o *número* do chamado para fechar:');\n    }\n    if (['5','enviar mídia','/midia','/foto'].includes(v)) {\n      save('await_photo_ticket',{});\n      return reply('📷🎥 Informe o *número* do chamado para anexar foto ou vídeo:');\n    }\n    if (['6','comentar chamado','/comentar'].includes(v)) {\n      save('await_comment_ticket',{});\n      return reply('💬 Informe o *número* do chamado para adicionar comentário:');\n    }\n    if (['7','foto/vídeo + solucionar','/fotosolucionar'].includes(v)) {\n      save('await_photosolve_ticket',{});\n      return reply('📷🎥 Informe o *número* do chamado para enviar mídia e solucionar:');\n    }\n  }\n\n  // ════════════════════════════════════════════\n  // FLUXO ABRIR CHAMADO\n  // ════════════════════════════════════════════\n\n  if (st === 'open_await_title') {\n    save('open_await_client_search', { title: userText });\n    return reply('🏢 Informe o nome do *cliente* para buscar:');\n  }\n\n  if (st === 'open_await_client_search') {\n    save('open_await_client_choice', { ...sd, client_search: userText });\n    return { json: { ...item.json, action:'search_entity', chat_id:chatId, search_term:userText, session_data: JSON.stringify({...sd, client_search:userText}) } };\n  }\n\n  if (st === 'open_await_client_choice') {\n    const idx = parseInt(userText,10);\n    const opts = sd.entity_options || [];\n    // Aceita tanto número quanto o texto do botão \"1 - Nome\"\n    const idxByText = opts.findIndex(o => userText.toLowerCase().includes(o.name.toLowerCase()));\n    const finalIdx = (!isNaN(idx) && idx >= 1 && idx <= opts.length) ? idx - 1 : idxByText;\n    if (finalIdx < 0) return reply(`❌ Opção inválida. Toque em um dos botões ou digite o número.`);\n    const chosen = opts[finalIdx];\n    save('open_await_description', { ...sd, entity_id: chosen.id, entity_name: chosen.name });\n    return reply(`✅ Cliente: *${chosen.name}*\\n\\n✍️ Informe a *descrição* do chamado:`);\n  }\n\n  if (st === 'open_await_description') {\n    save('open_await_priority', { ...sd, content: userText });\n    return reply(\n      '⚡ Escolha a *prioridade*:',\n      opcoesTeclado(['1 - Agendamento','2 - Normal 48h','3 - Solucionar','4 - Alerta','5 - Retorno/Serv. Rápido','6 - Urgente'])\n    );\n  }\n\n  if (st === 'open_await_priority') {\n    // Aceita \"4 - Alta\" ou \"4\" ou \"alta\"\n    const pText = userText.split(' - ')[0].trim();\n    const p = mapPriority(pText) || mapPriority(userText);\n    if (!p) return reply('❌ Prioridade inválida. Toque em um dos botões.',\n      opcoesTeclado(['1 - Agendamento','2 - Normal 48h','3 - Solucionar','4 - Alerta','5 - Retorno/Serv. Rápido','6 - Urgente'])\n    );\n    save('open_await_serial', { ...sd, priority: p });\n    return reply('🔢 Informe o *Serial* do equipamento, ou toque em *Pular*:',\n      opcoesTeclado(['Pular'])\n    );\n  }\n\n  if (st === 'open_await_serial') {\n    const serial = (userText.toLowerCase() === 'pular' || userText === '0') ? '' : userText;\n    // Lista de técnicos - SUBSTITUIR PELOS DADOS DA SUA EQUIPE\n    const tecnicos = [\n      { id: 1, name: 'Técnico 1' },\n      { id: 2, name: 'Técnico 2' },\n      { id: 3, name: 'Técnico 3' },\n      { id: 4, name: 'Técnico 4' },\n      { id: 5, name: 'Técnico 5' },\n      { id: 6, name: 'Técnico 6' }\n    ];\n    const rows = tecnicos.map(t => [{ text: t.name }]);\n    rows.push([{ text: '🏠 Menu' }, { text: '❌ Cancelar' }]);\n    const markup = { keyboard: rows, resize_keyboard: true, one_time_keyboard: true };\n    save('open_await_tech_choice', { ...sd, serial, user_options: tecnicos });\n    return reply('👨‍💻 Escolha o *técnico* responsável:', markup);\n  }\n\n  if (st === 'open_await_tech_choice') {\n    const opts = sd.user_options || [];\n    const idx = parseInt(userText,10);\n    // Aceita o nome do botão (ex: \"Djeyson\") ou número\n    const idxByName = opts.findIndex(o => o.name.toLowerCase() === userText.toLowerCase());\n    const finalIdx = (idxByName >= 0) ? idxByName\n                   : (!isNaN(idx) && idx >= 1 && idx <= opts.length) ? idx - 1 : -1;\n    if (finalIdx < 0) return reply(`❌ Opção inválida. Toque em um dos botões.`);\n    const chosen = opts[finalIdx];\n    const dias = proxDiasUteis(3);\n    const btnDatas = dias.map(d => `${dowLabel(d)} ${formatBR(d)}`);\n    save('open_await_start_date', { ...sd, tech_id: chosen.id, tech_name: chosen.name, start_date_options: dias.map(d=>formatBR(d)) });\n    return reply('📅 Escolha a *data de criação*:', opcoesTeclado(btnDatas));\n  }\n\n  if (st === 'open_await_start_date') {\n    const opts = sd.start_date_options || [];\n    // Tenta achar pelo botão \"Seg 21/04/2025\" ou pelo número\n    let finalIdx = -1;\n    const idx = parseInt(userText,10);\n    if (!isNaN(idx) && idx >= 1 && idx <= opts.length) {\n      finalIdx = idx - 1;\n    } else {\n      finalIdx = opts.findIndex(d => userText.includes(d));\n    }\n    if (finalIdx < 0) return reply('❌ Opção inválida. Toque em um dos botões.',\n      opcoesTeclado((sd.start_date_options||[]).map((d,i) => { const dias = proxDiasUteis(3); return `${dowLabel(dias[i])} ${d}`; }))\n    );\n    const chosenDate = opts[finalIdx];\n    const dias = proxDiasUteis(3);\n    const btnDatas = dias.map(d => `${dowLabel(d)} ${formatBR(d)}`);\n    save('open_await_due_date', { ...sd, start_date: chosenDate, due_date_options: dias.map(d=>formatBR(d)) });\n    return reply('⏰ Escolha a *data limite*:', opcoesTeclado(btnDatas));\n  }\n\n  if (st === 'open_await_due_date') {\n    const opts = sd.due_date_options || [];\n    let finalIdx = -1;\n    const idx = parseInt(userText,10);\n    if (!isNaN(idx) && idx >= 1 && idx <= opts.length) {\n      finalIdx = idx - 1;\n    } else {\n      finalIdx = opts.findIndex(d => userText.includes(d));\n    }\n    if (finalIdx < 0) return reply('❌ Opção inválida. Toque em um dos botões.');\n    const chosenDue = opts[finalIdx];\n    clear();\n    return {\n      json: {\n        ...item.json,\n        action:         'create_ticket',\n        chat_id:        chatId,\n        ticket_title:   sd.title,\n        ticket_content: sd.content,\n        entity_id:      sd.entity_id,\n        priority:       sd.priority,\n        serial:         sd.serial || '',\n        tech_id:        sd.tech_id,\n        start_date:     toGLPIDate(sd.start_date, '08:00:00'),\n        due_date:       toGLPIDate(chosenDue,     '17:00:00')\n      }\n    };\n  }\n\n  // ════════════════════════════════════════════\n  // FLUXO VER CHAMADO\n  // ════════════════════════════════════════════\n  if (st === 'await_view_ticket') {\n    const tid = extractTicket(userText);\n    if (!tid) return reply('❌ Número inválido. Digite apenas o número, ex: 1234');\n    clear();\n    return { json:{ ...item.json, action:'view_ticket', chat_id:chatId, ticket_id:tid } };\n  }\n\n  // ════════════════════════════════════════════\n  // FLUXO MUDAR STATUS\n  // ════════════════════════════════════════════\n  if (st === 'await_status_ticket') {\n    const tid = extractTicket(userText);\n    if (!tid) return reply('❌ Número inválido. Ex: 1234');\n    save('await_status_value', { ticket_id:tid });\n    return reply(\n      `Escolha o novo status do chamado *#${tid}*:`,\n      opcoesTeclado(['1 - Novo','2 - Em atendimento','3 - Planejado','4 - Pendente','5 - Resolvido','6 - Fechado'])\n    );\n  }\n\n  if (st === 'await_status_value') {\n    const pText = userText.split(' - ')[0].trim();\n    const code  = mapStatus(pText) || mapStatus(userText);\n    const tid   = sd.ticket_id || '';\n    if (!code) return reply('❌ Status inválido. Toque em um dos botões.',\n      opcoesTeclado(['1 - Novo','2 - Em atendimento','3 - Planejado','4 - Pendente','5 - Resolvido','6 - Fechado'])\n    );\n    clear();\n    if (code === 6) {\n      save('await_close_solution', { ticket_id:tid, from_status:true });\n      return reply(`🧾 Informe o texto de solução para fechar o chamado *#${tid}*:`);\n    }\n    return { json:{ ...item.json, action:'update_status', chat_id:chatId, ticket_id:tid, new_status:code } };\n  }\n\n  // ════════════════════════════════════════════\n  // FLUXO FECHAR CHAMADO\n  // ════════════════════════════════════════════\n  if (st === 'await_close_ticket') {\n    const tid = extractTicket(userText);\n    if (!tid) return reply('❌ Número inválido. Ex: 1234');\n    save('await_close_solution', { ticket_id:tid });\n    return reply(`🧾 Informe o texto de solução para fechar o chamado *#${tid}*:`);\n  }\n\n  if (st === 'await_close_solution') {\n    const tid = sd.ticket_id || '';\n    clear();\n    return { json:{ ...item.json, action:'close_ticket', chat_id:chatId, ticket_id:tid, solution_text:userText } };\n  }\n\n  // ════════════════════════════════════════════\n  // FLUXO COMENTAR CHAMADO\n  // ════════════════════════════════════════════\n  if (st === 'await_comment_ticket') {\n    const tid = extractTicket(userText);\n    if (!tid) return reply('❌ Número inválido. Ex: 1234');\n    save('await_comment_text', { ticket_id: tid });\n    return reply(`💬 Escreva o *comentário* para o chamado *#${tid}*:`);\n  }\n\n  if (st === 'await_comment_text') {\n    const tid = sd.ticket_id || '';\n    clear();\n    return { json:{ ...item.json, action:'add_comment', chat_id:chatId, ticket_id:tid, comment_text:userText } };\n  }\n\n  // ════════════════════════════════════════════\n  // FLUXO FOTO/VÍDEO + SOLUCIONAR\n  // ════════════════════════════════════════════\n  if (st === 'await_photosolve_ticket') {\n    const tid = extractTicket(userText);\n    if (!tid) return reply('❌ Número inválido. Ex: 1234');\n    save('photosolve_await_media', { ticket_id: tid });\n    return reply(`📷🎥 Envie a *foto ou vídeo* do chamado *#${tid}*:`);\n  }\n\n  if (st === 'photosolve_await_media') {\n    if (!isMedia) return reply('❌ Por favor envie uma foto ou vídeo.');\n    let file_id, file_type, file_unique_id;\n    if (isPhoto) {\n      const best = message.photo[message.photo.length - 1];\n      file_id = best.file_id; file_unique_id = best.file_unique_id || ''; file_type = 'photo';\n    } else {\n      const vid = message.video || message.video_note;\n      file_id = vid.file_id; file_unique_id = vid.file_unique_id || ''; file_type = 'video';\n    }\n    if (mediaGroupId) store.albums[mediaGroupId] = { ticket_id: sd.ticket_id, expiresAt: now + 600000 };\n    save('photosolve_await_solution', { ...sd, file_id, file_unique_id, file_type, media_group_id: mediaGroupId });\n    return reply(`✅ Mídia recebida!\\n\\n🧾 Agora escreva o texto de *solução* do chamado *#${sd.ticket_id}*:`);\n  }\n\n  if (st === 'photosolve_await_solution') {\n    const tid = sd.ticket_id || '';\n    clear();\n    return {\n      json: {\n        ...item.json,\n        action:         'photosolve',\n        chat_id:        chatId,\n        ticket_id:      tid,\n        file_id:        sd.file_id,\n        file_unique_id: sd.file_unique_id,\n        file_type:      sd.file_type,\n        media_group_id: sd.media_group_id || '',\n        solution_text:  userText\n      }\n    };\n  }\n\n  if (st === 'await_photo_ticket') {\n    const tid = extractTicket(userText);\n    if (!tid) return reply('❌ Número inválido. Ex: 1234');\n    save('photo_mode', { ticket_id:tid });\n    return reply(`📷 Modo foto ativado para chamado *#${tid}*.\\nEnvie as fotos. Pressione *❌ Cancelar* para sair.`);\n  }\n\n  if (isMedia) {\n    // Se está no fluxo photosolve_await_media, o bloco acima já tratou\n    let tid = '';\n    if (mediaGroupId && store.albums[mediaGroupId]?.ticket_id) tid = String(store.albums[mediaGroupId].ticket_id);\n    if (!tid) tid = extractTicket(userText);\n    if (!tid && (st === 'photo_mode') && sd.ticket_id) tid = String(sd.ticket_id);\n    if (!tid) return reply('📷🎥 Recebi a mídia, mas não sei em qual chamado anexar.\\nUse /foto 1234 ou menu > 5️⃣ Enviar mídia.');\n    if (mediaGroupId) store.albums[mediaGroupId] = { ticket_id:tid, expiresAt: now + 600000 };\n    let file_id, file_unique_id, file_type;\n    if (isPhoto) {\n      const best = message.photo[message.photo.length - 1];\n      file_id = best.file_id; file_unique_id = best.file_unique_id || ''; file_type = 'photo';\n    } else {\n      const vid = message.video || message.video_note;\n      file_id = vid.file_id; file_unique_id = vid.file_unique_id || ''; file_type = 'video';\n    }\n    return { json:{ ...item.json, action:'upload_media', chat_id:chatId, ticket_id:tid, file_id, file_unique_id, file_type, media_group_id:mediaGroupId } };\n  }\n\n  // fallback\n  return reply(menuText(), menuMarkup());\n});"
+      },
+      "id": "5b31a68c-7705-4869-b70a-df9835ae5640",
+      "name": "Roteador + Sessão",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4896,
+        3808
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/initSession' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "e2048fb0-d4f2-4ad9-944e-80782409bace",
+      "name": "Init Session GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5184,
+        3984
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "c1ab6909-9c8f-453c-a7a7-737e702a997c",
+      "name": "Merge Contexto + Sessão",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        5392,
+        3808
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-reply",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "reply",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "40d87ba2-5dac-48e0-b633-4559d80a2956",
+      "name": "É Resposta Simples?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5616,
+        3808
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $('Configuração').first().json.telegram_bot_token + '/sendMessage' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.chat_id, text: $json.reply_text, parse_mode: 'Markdown', reply_markup: $json.reply_markup || { keyboard: [[ { text: '🏠 Menu' } ]], resize_keyboard: true, one_time_keyboard: false } }) }}",
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "e30d065d-6ba1-4166-8ce0-e51d307ca66a",
+      "name": "Responder Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5872,
+        3424
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-search-entity",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "search_entity",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6228b736-24c2-48a4-90a1-324282717587",
+      "name": "É Busca de Cliente?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5840,
+        3808
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/search/Entity?criteria[0][field]=14&criteria[0][searchtype]=contains&criteria[0][value]=' + encodeURIComponent($json.search_term) + '&forcedisplay[0]=1&forcedisplay[1]=9&forcedisplay[2]=14&range=0-9' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Session-Token",
+              "value": "={{ $('Init Session GLPI').first().json.session_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "6dbf9bc1-e3b4-411f-904f-4dcbf94a789f",
+      "name": "Buscar Cliente GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6064,
+        3648
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "const store = $getWorkflowStaticData('global');\nconst ctx    = $('Merge Contexto + Sessão').first().json;\nconst chatId = ctx.chat_id;\nlet sd;\ntry { sd = JSON.parse(ctx.session_data || '{}'); } catch(e) { sd = {}; }\n\nconst results = items[0].json;\nconst raw  = results.data || results;\nconst list = Array.isArray(raw) ? raw : [];\n\nconst menuKeyboard = { keyboard: [[{ text: '🏠 Menu' }, { text: '❌ Cancelar' }]], resize_keyboard: true, one_time_keyboard: false };\n\nif (!list.length) {\n  store.sessions[chatId] = { state:'open_await_client_search', data:{ title: sd.title }, updatedAt: Date.now() };\n  return [{ json:{ chat_id:chatId, reply_text:'❌ Nenhum cliente encontrado para \"' + sd.client_search + '\".\\nTente outro trecho do nome:', reply_markup: menuKeyboard } }];\n}\n\nconst opts = list.slice(0,9).map(e => {\n  const id   = e['1'] ?? e.id;\n  const name = (e['14'] && String(e['14']) !== String(id)) ? e['14']\n             : (e['9']  && String(e['9'])  !== String(id)) ? e['9'] : null;\n  return { id, name };\n}).filter(o => o.name);\n\nif (!opts.length) {\n  store.sessions[chatId] = { state:'open_await_client_search', data:{ title: sd.title }, updatedAt: Date.now() };\n  return [{ json:{ chat_id:chatId, reply_text:'❌ Nenhum cliente encontrado.\\nTente outro trecho do nome:', reply_markup: menuKeyboard } }];\n}\n\n// Monta botões — 1 por linha para caber o nome completo\nconst rows = opts.map((o,i) => [{ text: `${i+1} - ${o.name}` }]);\nrows.push([{ text: '🏠 Menu' }, { text: '❌ Cancelar' }]);\nconst markup = { keyboard: rows, resize_keyboard: true, one_time_keyboard: true };\n\nstore.sessions[chatId] = {\n  state: 'open_await_client_choice',\n  data:  { ...sd, entity_options: opts },\n  updatedAt: Date.now()\n};\n\nreturn [{ json:{ chat_id:chatId, reply_text:'🏢 *Clientes encontrados:*\\n\\nToque no nome do cliente:', parse_mode:'Markdown', reply_markup: markup } }];"
+      },
+      "id": "b448776b-f603-4d5d-b12a-d38efb1a15db",
+      "name": "Processar Clientes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6288,
+        3648
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-create",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "create_ticket",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "db03d8e1-280e-4fa9-b72c-997f4c89abd5",
+      "name": "É Criar Chamado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6064,
+        4000
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/Ticket' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Session-Token",
+              "value": "={{ $('Init Session GLPI').first().json.session_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ input: { name: $json.ticket_title, content: $json.ticket_content, status: 1, entities_id: Number($json.entity_id), priority: Number($json.priority), date: $json.start_date, time_to_resolve: $json.due_date, externalid: $json.serial || '', _users_id_requester: 'SUBSTITUIR_PELO_ID_DO_SOLICITANTE', _users_id_assign: Number($json.tech_id) } }) }}",
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "cef929c2-493b-4cac-af2a-cb6ad895cdd0",
+      "name": "Criar Chamado GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6288,
+        4000
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Merge Contexto + Sessão').first().json;\nreturn items.map(item => {\n  const id = item.json.id || item.json.ID || '';\n  return { json:{ chat_id: ctx.chat_id, reply_text: id ? `✅ Chamado criado!\\n🎫 Número: *#${id}*` : '✅ Chamado criado com sucesso!', parse_mode:'Markdown', reply_markup: { keyboard: [[{ text: '🏠 Menu' }, { text: '❌ Cancelar' }]], resize_keyboard: true, one_time_keyboard: false } } };\n});"
+      },
+      "id": "e9f9a18d-0e43-44c0-9b41-1f85678d21fb",
+      "name": "Resposta Criar Chamado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6512,
+        4000
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-view",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "view_ticket",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "16f6d1ac-ff03-4189-bc7b-a6d8fe1b49cf",
+      "name": "É Ver Chamado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6288,
+        4176
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/Ticket/' + $json.ticket_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Session-Token",
+              "value": "={{ $('Init Session GLPI').first().json.session_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "ac6557b4-f19f-48f3-98ad-dbef29ffb99c",
+      "name": "Ver Chamado GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6512,
+        4176
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Merge Contexto + Sessão').first().json;\nreturn items.map(item => {\n  const t = item.json;\n  const statusMap = {1:'🆕 Novo',2:'🔧 Em atendimento',3:'📅 Planejado',4:'⏳ Pendente',5:'✅ Resolvido',6:'🔒 Fechado'};\n  const prioMap   = {1:'🔵 Muito baixa',2:'🟢 Baixa',3:'🟡 Média',4:'🟠 Alta',5:'🔴 Muito alta',6:'⚫ Crítico'};\n  const content   = (t.content||'-').replace(/<[^>]+>/g,'').substring(0,300);\n  const date      = t.date_creation ? new Date(t.date_creation).toLocaleString('pt-BR') : '-';\n  const due       = t.time_to_resolve ? new Date(t.time_to_resolve).toLocaleString('pt-BR') : '-';\n  const reply = [\n    `📋 *Chamado #${t.id}*`,\n    `📌 Status: ${statusMap[t.status]||t.status}`,\n    `⚡ Prioridade: ${prioMap[t.priority]||t.priority}`,\n    `📝 Título: ${t.name||'-'}`,\n    `📅 Aberto em: ${date}`,\n    `⏰ Prazo: ${due}`,\n    `🔢 Serial: ${t.externalid||'-'}`,\n    `📄 Descrição:\\n${content}`\n  ].join('\\n');\n  return { json:{ chat_id:ctx.chat_id, reply_text:reply, parse_mode:'Markdown', reply_markup: { keyboard: [[{ text: '🏠 Menu' }, { text: '❌ Cancelar' }]], resize_keyboard: true, one_time_keyboard: false } } };\n});"
+      },
+      "id": "2f8f0832-76e9-4c16-ac25-2cd458e3a6d8",
+      "name": "Resposta Ver Chamado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6736,
+        4176
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-status",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "update_status",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1f53c4aa-611b-4e08-8449-151a7141bfa6",
+      "name": "É Mudar Status?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6512,
+        4352
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/Ticket/' + $json.ticket_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Session-Token",
+              "value": "={{ $('Init Session GLPI').first().json.session_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ input: { status: Number($json.new_status) } }) }}",
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "fa12733f-8b4e-4675-b17a-7f8bd83dbbd5",
+      "name": "Atualizar Status GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6736,
+        4352
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Merge Contexto + Sessão').first().json;\nconst labels = {1:'Novo',2:'Em atendimento',3:'Planejado',4:'Pendente',5:'Resolvido',6:'Fechado'};\nreturn items.map(item => ({\n  json: { chat_id:ctx.chat_id, reply_text:`🔄 Status do chamado *#${ctx.ticket_id}* atualizado para: *${labels[ctx.new_status]||ctx.new_status}*`, parse_mode:'Markdown' }\n}));"
+      },
+      "id": "7989f682-8644-4bd4-ad2a-6bc4c381368f",
+      "name": "Resposta Atualizar Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6960,
+        4352
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-close",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "close_ticket",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b9ff4c98-3b2b-49ae-9b0e-c0cc1cb06c5f",
+      "name": "É Fechar Chamado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6832,
+        4624
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/ITILSolution' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Session-Token",
+              "value": "={{ $('Init Session GLPI').first().json.session_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ input: { itemtype:'Ticket', items_id: Number($json.ticket_id), content: $json.solution_text, solutiontypes_id: 0 } }) }}",
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "76626438-207e-48a4-9fad-ccfd993feb74",
+      "name": "Fechar Chamado GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7056,
+        4624
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Merge Contexto + Sessão').first().json;\nreturn items.map(item => ({\n  json: { chat_id:ctx.chat_id, reply_text:`✅ Chamado *#${ctx.ticket_id}* fechado com sucesso!`, parse_mode:'Markdown' }\n}));"
+      },
+      "id": "187029a6-f227-4fb0-910a-7e1f0043a226",
+      "name": "Resposta Fechar Chamado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7280,
+        4624
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-photo",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "upload_media",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e3d038f5-9342-4716-a233-b9c1332533c2",
+      "name": "É Upload Foto/Vídeo Simples?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6944,
+        5248
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.telegram.org/bot' + $('Configuração').first().json.telegram_bot_token + '/getFile?file_id=' + $json.file_id }}",
+        "options": {}
+      },
+      "id": "7f045f0f-b6f0-418e-93e1-6b991d749e18",
+      "name": "Telegram Get File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7200,
+        4848
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.telegram.org/file/bot' + $('Configuração').first().json.telegram_bot_token + '/' + $json.result.file_path }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "f9fd8b69-61a4-4bfb-9a8e-6df4181c3e30",
+      "name": "Download Photo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7424,
+        4848
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "03e05347-9a50-44c9-ada9-c94654572ae2",
+      "name": "Merge Dados + Binário",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        7648,
+        4848
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/TicketFollowup' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Session-Token",
+              "value": "={{ $('Init Session GLPI').first().json.session_token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "uploadManifest",
+              "value": "={{ JSON.stringify({ input: { tickets_id: Number($('Merge Contexto + Sessão').first().json.ticket_id), content: 'Foto enviada via Telegram', _filename: ['foto.jpg'] } }) }}"
+            },
+            {
+              "parameterType": "formBinaryData",
+              "name": "file[0]",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "0af6f5e0-589d-4178-bc85-dd8862ca4ccb",
+      "name": "Upload Foto GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7872,
+        4848
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Merge Contexto + Sessão').first().json;\nreturn items.map(item => ({\n  json: { chat_id:ctx.chat_id, reply_text:`📎 Foto anexada ao chamado *#${ctx.ticket_id}* com sucesso!`, parse_mode:'Markdown' }\n}));"
+      },
+      "id": "7e595fd6-f87b-4033-ae1d-db147b217ca2",
+      "name": "Resposta Upload Foto",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8096,
+        4848
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "06c2b326-0684-45d9-9e5b-35e47147e160",
+      "name": "Ignorar",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        7280,
+        5264
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "add_comment",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b9507dbd-d775-4855-a496-bcbe7c0b5ad2",
+      "name": "É Comentário?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6384,
+        4624
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/ITILFollowup' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Session-Token",
+              "value": "={{ $('Init Session GLPI').first().json.session_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ input: { itemtype: 'Ticket', items_id: Number($json.ticket_id), content: $json.comment_text, is_private: 0 } }) }}",
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "f37f1a31-5bd9-4d63-af07-365f9c3af959",
+      "name": "Comentar Chamado GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6608,
+        4624
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Merge Contexto + Sessão').first().json;\nreturn items.map(item => ({\n  json: {\n    chat_id: ctx.chat_id,\n    reply_text: `💬 Comentário adicionado ao chamado *#${ctx.ticket_id}* com sucesso!`,\n    parse_mode: 'Markdown',\n    reply_markup: { keyboard: [[{ text: '🏠 Menu' }, { text: '❌ Cancelar' }]], resize_keyboard: true, one_time_keyboard: false }\n  }\n}));"
+      },
+      "id": "5709fd02-4898-49db-9393-6ea0a95d88a4",
+      "name": "Resposta Comentário",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6832,
+        4624
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "upload_media",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c13801ba-780f-4e0c-a0c3-8454fae07591",
+      "name": "É Upload Mídia?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6464,
+        5056
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c3",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "photosolve",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "09c31d4e-9199-44a4-af9a-aa88e55d534a",
+      "name": "É PhotoSolve?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6528,
+        5424
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.telegram.org/bot' + $('Configuração').first().json.telegram_bot_token + '/getFile?file_id=' + $json.file_id }}",
+        "options": {}
+      },
+      "id": "241e0cc8-c1e8-48e7-8f7f-7ee4ee4efa33",
+      "name": "Get File Mídia",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6704,
+        4960
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.telegram.org/file/bot' + $('Configuração').first().json.telegram_bot_token + '/' + $json.result.file_path }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "42d93e33-e7d7-42c1-8315-90df22f07e24",
+      "name": "Download Mídia",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6976,
+        4944
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "2fd03222-665c-4d79-8b34-85a9e961023b",
+      "name": "Merge Mídia + Dados",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        7200,
+        5056
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/TicketFollowup' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Session-Token",
+              "value": "={{ $('Init Session GLPI').first().json.session_token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "uploadManifest",
+              "value": "={{ JSON.stringify({ input: { tickets_id: Number($('Merge Contexto + Sessão').first().json.ticket_id), content: ($('Merge Contexto + Sessão').first().json.file_type === 'video' ? 'Vídeo enviado via Telegram' : 'Foto enviada via Telegram'), _filename: [($('Merge Contexto + Sessão').first().json.file_type === 'video' ? 'video.mp4' : 'foto.jpg')] } }) }}"
+            },
+            {
+              "parameterType": "formBinaryData",
+              "name": "file[0]",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "f0bcdcfd-c786-4f3e-9484-ca046aea6462",
+      "name": "Upload Mídia GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7456,
+        5056
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Merge Contexto + Sessão').first().json;\nconst tipo = ctx.file_type === 'video' ? 'Vídeo' : 'Foto';\nreturn items.map(item => ({\n  json: {\n    chat_id: ctx.chat_id,\n    reply_text: `📎 ${tipo} anexado ao chamado *#${ctx.ticket_id}* com sucesso!`,\n    parse_mode: 'Markdown',\n    reply_markup: { keyboard: [[{ text: '🏠 Menu' }, { text: '❌ Cancelar' }]], resize_keyboard: true, one_time_keyboard: false }\n  }\n}));"
+      },
+      "id": "8f3f8ede-19d8-4e11-ad82-409125722705",
+      "name": "Resposta Upload Mídia",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7664,
+        5056
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.telegram.org/bot' + $('Configuração').first().json.telegram_bot_token + '/getFile?file_id=' + $json.file_id }}",
+        "options": {}
+      },
+      "id": "593b65c0-47bc-45e6-9c7a-eb854fd4612c",
+      "name": "Get File PhotoSolve",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6752,
+        5424
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.telegram.org/file/bot' + $('Configuração').first().json.telegram_bot_token + '/' + $json.result.file_path }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "1e2e5a7b-2fc5-4901-b2f5-1916ac5854fd",
+      "name": "Download PhotoSolve",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6976,
+        5424
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "f0de2eeb-724c-43a8-a2e1-a2bd03f8fa45",
+      "name": "Merge PhotoSolve",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        7200,
+        5424
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/TicketFollowup' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Session-Token",
+              "value": "={{ $('Init Session GLPI').first().json.session_token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "uploadManifest",
+              "value": "={{ JSON.stringify({ input: { tickets_id: Number($('Merge Contexto + Sessão').first().json.ticket_id), content: ($('Merge Contexto + Sessão').first().json.file_type === 'video' ? 'Vídeo da solução enviado via Telegram' : 'Foto da solução enviada via Telegram'), _filename: [($('Merge Contexto + Sessão').first().json.file_type === 'video' ? 'solucao.mp4' : 'solucao.jpg')] } }) }}"
+            },
+            {
+              "parameterType": "formBinaryData",
+              "name": "file[0]",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "a29dc9e3-00a3-48ac-904a-d777bac3f96e",
+      "name": "Upload Mídia PhotoSolve GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7424,
+        5424
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Configuração').first().json.glpi_base_url.replace(/\\/$/, '') + '/ITILSolution' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "App-Token",
+              "value": "={{ $('Configuração').first().json.glpi_app_token }}"
+            },
+            {
+              "name": "Session-Token",
+              "value": "={{ $('Init Session GLPI').first().json.session_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ input: { itemtype: 'Ticket', items_id: Number($('Merge Contexto + Sessão').first().json.ticket_id), content: $('Merge Contexto + Sessão').first().json.solution_text, solutiontypes_id: 0 } }) }}",
+        "options": {
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "cbdeb28e-31ee-42ed-9053-0bd3a9c066ce",
+      "name": "Fechar Chamado PhotoSolve GLPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7648,
+        5424
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Merge Contexto + Sessão').first().json;\nconst tipo = ctx.file_type === 'video' ? 'Vídeo' : 'Foto';\nreturn items.map(item => ({\n  json: {\n    chat_id: ctx.chat_id,\n    reply_text: `✅ ${tipo} anexado e chamado *#${ctx.ticket_id}* solucionado com sucesso!`,\n    parse_mode: 'Markdown',\n    reply_markup: { keyboard: [[{ text: '🏠 Menu' }, { text: '❌ Cancelar' }]], resize_keyboard: true, one_time_keyboard: false }\n  }\n}));"
+      },
+      "id": "0e5789db-54ae-496a-bb3f-36608e01c07c",
+      "name": "Resposta PhotoSolve",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7872,
+        5424
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Configuração",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configuração": {
+      "main": [
+        [
+          {
+            "node": "Roteador + Sessão",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Init Session GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Roteador + Sessão": {
+      "main": [
+        [
+          {
+            "node": "Merge Contexto + Sessão",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Session GLPI": {
+      "main": [
+        [
+          {
+            "node": "Merge Contexto + Sessão",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Contexto + Sessão": {
+      "main": [
+        [
+          {
+            "node": "É Resposta Simples?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É Resposta Simples?": {
+      "main": [
+        [
+          {
+            "node": "Responder Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "É Busca de Cliente?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É Busca de Cliente?": {
+      "main": [
+        [
+          {
+            "node": "Buscar Cliente GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "É Criar Chamado?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar Cliente GLPI": {
+      "main": [
+        [
+          {
+            "node": "Processar Clientes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Processar Clientes": {
+      "main": [
+        [
+          {
+            "node": "Responder Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É Criar Chamado?": {
+      "main": [
+        [
+          {
+            "node": "Criar Chamado GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "É Ver Chamado?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Criar Chamado GLPI": {
+      "main": [
+        [
+          {
+            "node": "Resposta Criar Chamado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resposta Criar Chamado": {
+      "main": [
+        [
+          {
+            "node": "Responder Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É Ver Chamado?": {
+      "main": [
+        [
+          {
+            "node": "Ver Chamado GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "É Mudar Status?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ver Chamado GLPI": {
+      "main": [
+        [
+          {
+            "node": "Resposta Ver Chamado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resposta Ver Chamado": {
+      "main": [
+        [
+          {
+            "node": "Responder Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É Mudar Status?": {
+      "main": [
+        [
+          {
+            "node": "Atualizar Status GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "É Fechar Chamado?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Atualizar Status GLPI": {
+      "main": [
+        [
+          {
+            "node": "Resposta Atualizar Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resposta Atualizar Status": {
+      "main": [
+        [
+          {
+            "node": "Responder Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É Fechar Chamado?": {
+      "main": [
+        [
+          {
+            "node": "Fechar Chamado GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "É Comentário?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fechar Chamado GLPI": {
+      "main": [
+        [
+          {
+            "node": "Resposta Fechar Chamado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resposta Fechar Chamado": {
+      "main": [
+        [
+          {
+            "node": "Responder Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Get File": {
+      "main": [
+        [
+          {
+            "node": "Download Photo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Photo": {
+      "main": [
+        [
+          {
+            "node": "Merge Dados + Binário",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Dados + Binário": {
+      "main": [
+        [
+          {
+            "node": "Upload Foto GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Foto GLPI": {
+      "main": [
+        [
+          {
+            "node": "Resposta Upload Foto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resposta Upload Foto": {
+      "main": [
+        [
+          {
+            "node": "Responder Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É Comentário?": {
+      "main": [
+        [
+          {
+            "node": "Comentar Chamado GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "É Upload Mídia?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Comentar Chamado GLPI": {
+      "main": [
+        [
+          {
+            "node": "Resposta Comentário",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resposta Comentário": {
+      "main": [
+        [
+          {
+            "node": "Responder Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É Upload Mídia?": {
+      "main": [
+        [
+          {
+            "node": "Get File Mídia",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Mídia + Dados",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "É PhotoSolve?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get File Mídia": {
+      "main": [
+        [
+          {
+            "node": "Download Mídia",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Mídia": {
+      "main": [
+        [
+          {
+            "node": "Merge Mídia + Dados",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Mídia + Dados": {
+      "main": [
+        [
+          {
+            "node": "Upload Mídia GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Mídia GLPI": {
+      "main": [
+        [
+          {
+            "node": "Resposta Upload Mídia",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resposta Upload Mídia": {
+      "main": [
+        [
+          {
+            "node": "Responder Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É PhotoSolve?": {
+      "main": [
+        [
+          {
+            "node": "Get File PhotoSolve",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge PhotoSolve",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "É Upload Foto/Vídeo Simples?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get File PhotoSolve": {
+      "main": [
+        [
+          {
+            "node": "Download PhotoSolve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download PhotoSolve": {
+      "main": [
+        [
+          {
+            "node": "Merge PhotoSolve",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge PhotoSolve": {
+      "main": [
+        [
+          {
+            "node": "Upload Mídia PhotoSolve GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Mídia PhotoSolve GLPI": {
+      "main": [
+        [
+          {
+            "node": "Fechar Chamado PhotoSolve GLPI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fechar Chamado PhotoSolve GLPI": {
+      "main": [
+        [
+          {
+            "node": "Resposta PhotoSolve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resposta PhotoSolve": {
+      "main": [
+        [
+          {
+            "node": "Responder Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É Upload Foto/Vídeo Simples?": {
+      "main": [
+        [
+          {
+            "node": "Telegram Get File",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Dados + Binário",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ignorar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "b7ecb340-41ad-4d33-a272-76559d5defe2",
+  "meta": {
+    "instanceId": "58f1a819955fc505dac1422edce64b8cc5461b530286df17a3db22c169f602d5"
+  },
+  "id": "vk7nNV7Jkv3CnmLT",
+  "tags": []
+}
