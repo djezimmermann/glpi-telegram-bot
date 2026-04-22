@@ -39,3 +39,20 @@ Projeto criado para facilitar o atendimento técnico e agilizar operações do S
 ```text
 glpi-telegram-bot-sanitized.json
 README.md
+
+Segurança
+
+Este repositório contém versão sanitizada para portfólio:
+
+Tokens removidos
+Credenciais removidas
+URLs internas ocultadas
+Dados sensíveis substituídos
+Objetivo Profissional
+
+Demonstrar conhecimento em automação corporativa, integrações entre sistemas, atendimento técnico inteligente e uso prático de n8n em ambiente real.
+
+Contato
+
+Instagram: @djeysoninacio
+Email: djezimmermann@gmail.com
