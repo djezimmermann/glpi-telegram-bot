@@ -46,7 +46,7 @@ Este repositório contém versão sanitizada para portfólio:
 ## Estrutura do Projeto
 
 ```text
-glpi-telegram-bot-sanitized.json
+GLPI Bot Telegram.json
 README.md
 
 
